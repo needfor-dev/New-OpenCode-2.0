@@ -235,110 +235,175 @@ function clampedRand(min, max, bias = 0.5) {
 }
 
 /* ========================================================================= */
-/*  Element finders — robust multi-strategy detection                        */
+/*  Element finders — deep multi-strategy detection                          */
 /* ========================================================================= */
 
 /**
- * Check if an element is visible and clickable.
+ * Deep scan the entire page for clickable elements matching keywords.
+ * Checks:
+ *   - button, a, [role="button"], input[type="button/submit"]
+ *   - Text in innerText, textContent, aria-label, title, alt, value, placeholder
+ *   - Child element text (spans, divs inside buttons)
+ *   - Class names, id, href
+ *   - Shadow DOM (light pierce)
+ *   - Iframes (switches context)
+ * Returns the first visible matching element.
  */
-async function isElementVisible(el) {
-  try {
-    const box = await el.boundingBox().catch(() => null);
-    if (!box) return false;
-    if (box.width <= 0 || box.height <= 0) return false;
-    const visible = await el.isIntersectingViewport().catch(() => true);
-    const disabled = await el.evaluate((node) => node.disabled || node.getAttribute('aria-disabled') === 'true').catch(() => false);
-    if (disabled) return false;
-    return true;
-  } catch (_) { return false; }
-}
+async function findByKeywords(page, keywords, debug, options = {}) {
+  const { maxDepth = 3, waitMs = 0, iframeCheck = true } = options;
 
-/**
- * Get all clickable elements on the page with their text signals.
- */
-async function getClickableElements(page) {
-  const els = await page.$$('button, a, [role="button"], input[type="button"], input[type="submit"]').catch(() => []);
-  const results = [];
-  for (const el of els) {
-    try {
-      const signal = await el.evaluate((node) => {
-        const t = (node.innerText || node.textContent || '').toLowerCase().trim();
-        const aria = (node.getAttribute('aria-label') || '').toLowerCase().trim();
-        const title = (node.getAttribute('title') || '').toLowerCase().trim();
-        const cls = (node.className || '').toLowerCase();
-        const id = (node.id || '').toLowerCase();
-        const href = (node.getAttribute('href') || '').toLowerCase();
-        const data = (node.getAttribute('data-text') || '').toLowerCase().trim();
-        return { t, aria, title, cls, id, href, data };
-      });
-      const fullText = `${signal.t} ${signal.aria} ${signal.title} ${signal.cls} ${signal.id} ${signal.href} ${signal.data}`.trim();
-      results.push({ el, fullText });
-    } catch (_) {}
-  }
-  return results;
-}
+  // Wait for dynamic content if requested
+  if (waitMs > 0) await sleep(waitMs);
 
-/**
- * Find the best matching element by keyword from all clickable elements.
- */
-async function findByKeyword(page, keywords, debug) {
-  const elements = await getClickableElements(page);
-  let best = null;
-  let bestScore = 0;
+  const result = await page.evaluate(({ keywords, maxDepth, iframeCheck }) => {
+    function getText(node) {
+      if (!node) return '';
+      // Get all visible text from node and its children
+      const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null, false);
+      let text = '';
+      let n;
+      while (n = walker.nextNode()) {
+        const t = n.textContent || '';
+        if (t.trim()) text += t + ' ';
+      }
+      return text.toLowerCase().trim();
+    }
 
-  for (const { el, fullText } of elements) {
-    if (!(await isElementVisible(el))) continue;
+    function nodeMatches(node, kwList) {
+      const text = getText(node);
+      if (!text) return 0;
+      let score = 0;
+      for (const kw of kwList) {
+        const k = kw.toLowerCase();
+        if (text === k) score += 10;           // exact match
+        else if (text.startsWith(k)) score += 7; // starts with
+        else if (text.endsWith(k)) score += 5;   // ends with
+        else if (text.includes(k)) score += 3;   // contains
+      }
+      // Boost for button-like tags
+      const tag = (node.tagName || '').toLowerCase();
+      if (tag === 'button') score += 5;
+      if (tag === 'a' && node.href) score += 3;
+      if (node.getAttribute('role') === 'button') score += 4;
+      if (node.type === 'button' || node.type === 'submit') score += 4;
+      // Boost for size
+      const rect = node.getBoundingClientRect();
+      if (rect.width > 60 && rect.height > 25) score += 2;
+      if (rect.width > 100 && rect.height > 40) score += 2;
+      return score;
+    }
 
-    let score = 0;
-    const lower = fullText;
+    function scanNode(node, depth, kwList) {
+      if (!node || depth > maxDepth) return null;
+      if (node.nodeType !== 1) return null; // only elements
 
-    // Exact keyword match scores higher
-    for (const kw of keywords) {
-      if (lower.includes(kw)) {
-        if (lower === kw || lower.startsWith(kw) || lower.endsWith(kw)) score += 3;
-        else score += 1;
+      const score = nodeMatches(node, kwList);
+      if (score > 0) {
+        // Check visible
+        const rect = node.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          const style = window.getComputedStyle(node);
+          if (style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0') {
+            return { node, score };
+          }
+        }
+      }
+
+      // Check shadow DOM
+      if (node.shadowRoot) {
+        const shadowResult = scanNode(node.shadowRoot, depth + 1, kwList);
+        if (shadowResult) return shadowResult;
+      }
+
+      // Check children
+      const children = node.children || node.childNodes || [];
+      for (let i = 0; i < children.length; i++) {
+        const childResult = scanNode(children[i], depth + 1, kwList);
+        if (childResult) return childResult;
+      }
+
+      return null;
+    }
+
+    // Scan document body
+    const body = document.body;
+    if (body) {
+      const result = scanNode(body, 0, keywords);
+      if (result) return result.node;
+    }
+
+    // Check iframes
+    if (iframeCheck) {
+      const frames = document.querySelectorAll('iframe');
+      for (let i = 0; i < frames.length; i++) {
+        try {
+          const frame = frames[i];
+          const frameDoc = frame.contentDocument || frame.contentWindow?.document;
+          if (frameDoc) {
+            const frameBody = frameDoc.body;
+            if (frameBody) {
+              const result = scanNode(frameBody, 0, keywords);
+              if (result) {
+                // Return a marker that this is inside an iframe
+                return { node: result.node, inIframe: true, frameIndex: i };
+              }
+            }
+          }
+        } catch (_) {}
       }
     }
 
-    // Prefer elements with reasonable size
-    try {
-      const box = await el.boundingBox().catch(() => null);
-      if (box && box.width > 60 && box.height > 20) score += 1;
-    } catch (_) {}
+    return null;
+  }, { keywords, maxDepth, iframeCheck });
 
-    if (score > bestScore) {
-      bestScore = score;
-      best = el;
-    }
+  if (!result) {
+    if (debug) console.log(`  findByKeywords: no match for ${keywords.join(', ')}`);
+    return null;
   }
 
-  if (best && bestScore > 0) return best;
-  if (debug) console.log(`  findByKeyword: no match for ${keywords.join(', ')}`);
-  return null;
+  // If result is inside an iframe, we can't easily click it from here
+  // (puppeteer needs frame.page() which is complex). Return null for iframe matches
+  // so the caller can fall back to other strategies.
+  if (result.inIframe) {
+    if (debug) console.log(`  findByKeywords: match found inside iframe (skipping, cross-frame click not supported)`);
+    return null;
+  }
+
+  return result.node;
 }
 
 /**
- * Fallback: return first visible clickable element.
+ * Wait for an element matching keywords to appear (retry polling).
  */
-async function findFirstClickable(page, debug) {
-  const elements = await getClickableElements(page);
-  for (const { el } of elements) {
-    if (await isElementVisible(el)) return el;
-  }
-  return null;
-}
-
-/**
- * Wait for an element matching keywords to appear (retry up to ~5 seconds).
- */
-async function waitForElementByKeyword(page, keywords, debug, maxMs = 5000) {
+async function waitForElementByKeywords(page, keywords, debug, maxMs = 5000) {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
-    const el = await findByKeyword(page, keywords, debug);
+    const el = await findByKeywords(page, keywords, debug, { waitMs: 500, iframeCheck: false });
     if (el) return el;
-    await sleep(500);
+    await sleep(400);
   }
   return null;
+}
+
+/**
+ * Fallback: return first visible clickable element on page.
+ */
+async function findFirstClickable(page, debug) {
+  const el = await page.evaluate(() => {
+    const candidates = document.querySelectorAll('button, a[href], [role="button"], input[type="button"], input[type="submit"]');
+    for (let i = 0; i < candidates.length; i++) {
+      const node = candidates[i];
+      const rect = node.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        const style = window.getComputedStyle(node);
+        if (style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0') {
+          return node;
+        }
+      }
+    }
+    return null;
+  });
+  return el;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -346,57 +411,56 @@ async function waitForElementByKeyword(page, keywords, debug, maxMs = 5000) {
 /* -------------------------------------------------------------------------- */
 
 async function findOpenButton(page, debug) {
-  // First try keyword match
-  const el = await findByKeyword(page, ['open', 'go', 'start', 'enter'], debug);
+  // Try keyword match first
+  let el = await findByKeywords(page, ['open', 'go', 'start', 'enter'], debug);
   if (el) return el;
-  // Wait a bit more for dynamic content
-  const waited = await waitForElementByKeyword(page, ['open', 'go', 'start', 'enter'], debug, 3000);
-  if (waited) return waited;
+  // Wait for dynamic content
+  el = await waitForElementByKeywords(page, ['open', 'go', 'start', 'enter'], debug, 4000);
+  if (el) return el;
   // Fallback
   return findFirstClickable(page, debug);
 }
 
 async function findNextButton(page, debug) {
-  const el = await findByKeyword(page, ['next'], debug);
+  let el = await findByKeywords(page, ['next'], debug);
   if (el) return el;
-  const waited = await waitForElementByKeyword(page, ['next'], debug, 2000);
-  if (waited) return waited;
+  el = await waitForElementByKeywords(page, ['next'], debug, 3000);
+  if (el) return el;
   return null;
 }
 
 async function checkScrollDown(page, debug) {
-  const el = await findByKeyword(page, ['scroll down', 'scroll', 'down'], debug);
+  const el = await findByKeywords(page, ['scroll down', 'scroll', 'down'], debug);
   if (el) {
     if (debug) console.log('  checkScrollDown: found scroll down element');
     return true;
   }
-  const waited = await waitForElementByKeyword(page, ['scroll down', 'scroll', 'down'], debug, 2000);
+  const waited = await waitForElementByKeywords(page, ['scroll down', 'scroll', 'down'], debug, 3000);
   if (waited) return true;
   return false;
 }
 
 async function findContinueButton(page, debug) {
-  const el = await findByKeyword(page, ['continue'], debug);
+  let el = await findByKeywords(page, ['continue'], debug);
   if (el) return el;
-  const waited = await waitForElementByKeyword(page, ['continue'], debug, 2000);
-  if (waited) return waited;
+  el = await waitForElementByKeywords(page, ['continue'], debug, 3000);
+  if (el) return el;
   return null;
 }
 
 async function findGoToLinkButton(page, debug) {
-  const el = await findByKeyword(page, ['go to link', 'goto', 'visit', 'proceed'], debug);
+  let el = await findByKeywords(page, ['go to link', 'goto', 'visit', 'proceed'], debug);
   if (el) return el;
-  const waited = await waitForElementByKeyword(page, ['go to link', 'goto', 'visit', 'proceed'], debug, 2000);
-  if (waited) return waited;
+  el = await waitForElementByKeywords(page, ['go to link', 'goto', 'visit', 'proceed'], debug, 3000);
+  if (el) return el;
   return null;
 }
 
 async function findOpenLinkButton(page, debug) {
-  const el = await findByKeyword(page, ['open link', 'open'], debug);
+  let el = await findByKeywords(page, ['open link', 'open'], debug);
   if (el) return el;
-  const waited = await waitForElementByKeyword(page, ['open link', 'open'], debug, 2000);
-  if (waited) return waited;
-  // Last resort fallback
+  el = await waitForElementByKeywords(page, ['open link', 'open'], debug, 4000);
+  if (el) return el;
   return findFirstClickable(page, debug);
 }
 

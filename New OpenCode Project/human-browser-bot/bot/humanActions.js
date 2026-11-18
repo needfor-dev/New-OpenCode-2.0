@@ -138,10 +138,15 @@ async function humanClick(page, selector, {
     await scrollElementIntoView(el).catch(() => {});
     await sleep(rand(100, 250));
     const box = await el.boundingBox().catch(() => null);
-    if (!box) return false;
-    const margin = Math.min(4, Math.floor(box.width / 4), Math.floor(box.height / 4));
-    x = clamp(rand(box.x + margin, box.x + box.width - margin), box.x + 1, box.x + box.width - 1);
-    y = clamp(rand(box.y + margin, box.y + box.height - margin), box.y + 1, box.y + box.height - 1);
+    if (box) {
+      const margin = Math.min(4, Math.floor(box.width / 4), Math.floor(box.height / 4));
+      x = clamp(rand(box.x + margin, box.x + box.width - margin), box.x + 1, box.x + box.width - 1);
+      y = clamp(rand(box.y + margin, box.y + box.height - margin), box.y + 1, box.y + box.height - 1);
+    } else {
+      // boundingBox failed — try JS fallback click directly on the element
+      const jsClicked = await jsFallbackClick(page, el, { debug });
+      return jsClicked;
+    }
   }
 
   // Pre-click hesitation: hover near target, maybe move away slightly then back (curious human)
@@ -158,11 +163,41 @@ async function humanClick(page, selector, {
   }
 
   await sleep(rand(50, 240)); // dwell before press
-  await page.mouse.down().catch(() => {});           // REAL mouse down
+
+  // REAL mouse down/up at the calculated coordinates
+  await page.mouse.down().catch(() => {});
   await sleep(clampedRand(minPressMs, maxPressMs, 0.5)); // hold press
   await page.mouse.up().catch(() => {});             // REAL mouse up
   await sleep(rand(90, 400));                        // dwell after release
   return true;
+}
+
+/**
+ * Fallback click using JavaScript to dispatch mouse events directly on the element.
+ * Used when boundingBox fails but we still want to trigger a real click.
+ */
+async function jsFallbackClick(page, el, { debug = false } = {}) {
+  try {
+    const result = await page.evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return false;
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      // Dispatch mousedown, mouseup, click
+      element.dispatchEvent(new MouseEvent('mousedown', {
+        bubbles: true, cancelable: true, clientX: cx, clientY: cy
+      }));
+      element.dispatchEvent(new MouseEvent('mouseup', {
+        bubbles: true, cancelable: true, clientX: cx, clientY: cy
+      }));
+      element.dispatchEvent(new MouseEvent('click', {
+        bubbles: true, cancelable: true, clientX: cx, clientY: cy
+      }));
+      return true;
+    }, el);
+    if (debug && result) console.log('  jsFallbackClick: dispatched click events');
+    return result;
+  } catch (_) { return false; }
 }
 
 /* -------------------------------------------------------------------------- */
